@@ -8,5 +8,6 @@ Use the canonical backend doc for:
 - response envelope and error envelope rules
 - request ID propagation semantics
 - route partitioning under `/api/v1`
+- auth endpoint contract for `login`, `refresh`, `me`, `logout`, and `logout-all`
 - idempotency and optimistic concurrency expectations
 - `GET /api/v1`, `GET /api/v1/healthz`, and `GET /api/v1/readyz`

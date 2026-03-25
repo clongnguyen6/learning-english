@@ -14,7 +14,11 @@ import (
 
 	"learning-english/backend/internal/config"
 	"learning-english/backend/internal/database"
+	"learning-english/backend/internal/handlers"
+	"learning-english/backend/internal/repositories"
 	"learning-english/backend/internal/router"
+	"learning-english/backend/internal/services"
+	"learning-english/backend/internal/utils"
 )
 
 const serviceName = "learning-english-api"
@@ -29,11 +33,51 @@ func main() {
 	}
 
 	logger := newLogger(cfg.HTTP.LogLevel)
+
 	db := database.New(cfg.Database.URL)
+	if err := db.Ping(context.Background()); err != nil {
+		logger.Warn("database ping failed during startup; readiness will stay degraded until the dependency is reachable", "error", err)
+	}
+	defer db.Close()
+
+	tokenManager, err := utils.NewTokenManager(utils.TokenManagerConfig{
+		Issuer:      cfg.Auth.Issuer,
+		Audience:    cfg.Auth.Audience,
+		HS256Secret: cfg.Auth.HS256Secret,
+		TTL:         cfg.Auth.AccessTokenTTL,
+	})
+	if err != nil {
+		log.Printf("failed to initialize token manager: %v", err)
+		os.Exit(1)
+	}
+
+	authService, err := services.NewAuthService(services.AuthServiceConfig{
+		Repositories:    repositories.NewSQLAuthRepositoryProvider(db),
+		Tokens:          tokenManager,
+		RefreshTokenTTL: cfg.Auth.RefreshTokenTTL,
+	})
+	if err != nil {
+		log.Printf("failed to initialize auth service: %v", err)
+		os.Exit(1)
+	}
+
+	authHandler, err := handlers.NewAuthHandler(handlers.AuthHandlerConfig{
+		Service: authService,
+		RefreshCookie: utils.RefreshCookieConfig{
+			Name:     cfg.Auth.RefreshCookie.Name,
+			Domain:   cfg.Auth.RefreshCookie.Domain,
+			Secure:   cfg.Auth.RefreshCookie.Secure,
+			SameSite: cfg.Auth.RefreshCookie.SameSiteMode(),
+		},
+	})
+	if err != nil {
+		log.Printf("failed to initialize auth handler: %v", err)
+		os.Exit(1)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.HTTP.Addr,
-		Handler:           router.New(router.Dependencies{Config: cfg, Logger: logger, Database: db, ServiceName: serviceName, Version: version}),
+		Handler:           router.New(router.Dependencies{Config: cfg, Logger: logger, Database: db, AuthHandler: authHandler, ServiceName: serviceName, Version: version}),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
