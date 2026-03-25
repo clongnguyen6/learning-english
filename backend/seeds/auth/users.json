@@ -1,0 +1,33 @@
+{
+  "seed_version": 1,
+  "notes": [
+    "Local-only seed manifest. Do not reuse these plaintext passwords outside development.",
+    "Roles align with the planned learner/admin split in PLAN.md."
+  ],
+  "users": [
+    {
+      "username": "admin_demo",
+      "display_name": "Admin Demo",
+      "role": "admin",
+      "status": "active",
+      "password_plaintext": "AdminDemo123!",
+      "purpose": "Runs admin import, publish, rollback, and audit-log smoke flows."
+    },
+    {
+      "username": "learner_alex",
+      "display_name": "Alex Nguyen",
+      "role": "learner",
+      "status": "active",
+      "password_plaintext": "LearnerDemo123!",
+      "purpose": "Exercises vocabulary, grammar, and reading happy-path flows."
+    },
+    {
+      "username": "learner_mina",
+      "display_name": "Mina Tran",
+      "role": "learner",
+      "status": "active",
+      "password_plaintext": "LearnerDemo123!",
+      "purpose": "Provides a second learner for progress and session-isolation checks."
+    }
+  ]
+}

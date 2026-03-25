@@ -142,7 +142,10 @@ Xây dựng một website học tiếng Anh với 4 module chính:
    - reading
    - imports
    - content revisions
+   - publications
+   - content audit logs
    - jobs
+   - job attempts
    - auth events
 ```
 
@@ -202,7 +205,7 @@ learning-english/
 - dto: request/response schema
 - middleware: auth, logging, recovery, CORS, request ID
 - importers: parse Markdown/text/CSV thành dữ liệu có cấu trúc
-- jobs: background workers cho commit/publish/unpublish và retry
+- jobs: background workers cho commit/publish/unpublish, lease-based execution và retry
 - storage: upload, signed URL, asset metadata
 - router: phân vùng public/private/admin routes
 
@@ -329,6 +332,7 @@ learning-english/
   - lowercase
   - tùy chọn bỏ punctuation
   - hỗ trợ strict/lenient mode
+- mỗi session nên snapshot item/question đã phát ra để retry, resume và analytics deterministic
 
 #### Learner UX refinement
 
@@ -370,6 +374,7 @@ Markdown nên parse thành:
 - frontmatter validation bắt buộc
 - lesson có `status` rõ ràng: `draft`, `published`, `archived`
 - exercises tách khỏi lesson content để có thể reuse theo topic
+- live history đi qua publication records; learner chỉ đọc active publication
 
 #### Highlight strategy
 
@@ -419,6 +424,8 @@ Reading content phải lưu theo sections để:
 - không render toàn bộ bài dài thành một blob nếu document lớn
 - không theo đuổi pixel-perfect sync scroll ở MVP
 - section pairing lỗi phải block publish
+- learner chỉ đọc published projection thuộc active publication, không đụng draft/source state
+- highlights và progress phải được gắn với publication context để rollback/publish mới không làm lệch dữ liệu
 
 ### 4.5. Admin / Content Operations module
 
@@ -429,14 +436,18 @@ Reading content phải lưu theo sections để:
 - import vocabulary CSV/JSON
 - preview parse result trước khi commit
 - xem validation errors
+- xem diff giữa bản live và revision sắp publish
+- yêu cầu change summary khi publish/rollback
 - publish/unpublish nội dung
 - xem import history
+- xem publication history và audit log
 
 #### Mục tiêu
 
 - learner APIs ổn định và gọn
 - admin workflows không làm bẩn learner domain
 - content team có thể vận hành mà không chạm DB trực tiếp
+- publication model rõ ràng để rollback, audit và cache không bị nhập nhằng draft/live
 
 ## 5. Database schema
 
@@ -455,6 +466,7 @@ Reading content phải lưu theo sections để:
 - vocab_word_media
 - user_vocab_progress
 - vocab_study_sessions
+- vocab_session_items
 - vocab_quiz_attempts
 
 #### Grammar
@@ -477,7 +489,10 @@ Reading content phải lưu theo sections để:
 - imports
 - import_errors
 - content_revisions
+- publications
+- content_audit_logs
 - jobs
+- job_attempts
 - idempotency_keys
 - auth_events
 
@@ -541,13 +556,12 @@ language_to         varchar default 'vi'
 status              varchar not null default 'draft'   -- draft/published/archived
 latest_import_id    uuid null fk -> imports.id
 draft_revision_id   uuid null fk -> content_revisions.id
-published_revision_id uuid null fk -> content_revisions.id
+active_publication_id uuid null fk -> publications.id
 word_count          integer default 0
 sort_order          integer default 0
-published_at        timestamptz null
-published_by        uuid null fk -> users.id
 created_at          timestamptz
 updated_at          timestamptz
+version             integer not null default 1
 ```
 
 #### 5.2.4. `vocab_words`
@@ -646,6 +660,7 @@ ordering            varchar not null      -- random/sequential/repeat
 show_ipa            boolean default true
 status_filter       varchar               -- all/new/learning/mastered
 auto_next           boolean default true
+current_question_seq integer default 0
 started_at          timestamptz
 ended_at            timestamptz null
 total_items         integer default 0
@@ -655,27 +670,48 @@ updated_at          timestamptz
 version             integer not null default 1
 ```
 
-#### 5.2.9. `vocab_quiz_attempts`
+#### 5.2.9. `vocab_session_items`
 
 ```text
 id                  uuid pk
 session_id          uuid fk -> vocab_study_sessions.id
-user_id             uuid fk -> users.id
 word_id             uuid fk -> vocab_words.id
+question_seq        integer not null
 question_type       varchar not null      -- mcq/write/flip
 prompt_language     varchar not null      -- en/vi
-answer_text         text
-selected_option     text
-is_correct          boolean
-answered_at         timestamptz
-question_seq        integer not null
+prompt_text         text not null
+options_json        jsonb null
+correct_answer      text not null
+status              varchar not null default 'pending'   -- pending/answered/skipped
+created_at          timestamptz
 ```
 
 Unique:
 
 - `unique (session_id, question_seq)`
 
-#### 5.2.10. `grammar_topics`
+#### 5.2.10. `vocab_quiz_attempts`
+
+```text
+id                  uuid pk
+session_id          uuid fk -> vocab_study_sessions.id
+session_item_id     uuid fk -> vocab_session_items.id
+user_id             uuid fk -> users.id
+word_id             uuid fk -> vocab_words.id
+question_type       varchar not null      -- mcq/write/flip
+prompt_language     varchar not null      -- en/vi
+answer_text         text
+selected_option_index integer null
+is_correct          boolean
+answered_at         timestamptz
+request_idempotency_key varchar null
+```
+
+Unique:
+
+- `unique (session_id, session_item_id)`
+
+#### 5.2.11. `grammar_topics`
 
 ```text
 id                  uuid pk
@@ -688,7 +724,7 @@ created_at          timestamptz
 updated_at          timestamptz
 ```
 
-#### 5.2.11. `grammar_lessons`
+#### 5.2.12. `grammar_lessons`
 
 ```text
 id                  uuid pk
@@ -699,20 +735,19 @@ summary             text
 status              varchar not null default 'draft'   -- draft/published/archived
 latest_import_id    uuid null fk -> imports.id
 draft_revision_id   uuid null fk -> content_revisions.id
-published_revision_id uuid null fk -> content_revisions.id
-published_at        timestamptz null
-published_by        uuid null fk -> users.id
+active_publication_id uuid null fk -> publications.id
 sort_order          integer default 0
 created_at          timestamptz
 updated_at          timestamptz
+version             integer not null default 1
 ```
 
-#### 5.2.12. `grammar_exercises`
+#### 5.2.13. `grammar_exercises`
 
 ```text
 id                  uuid pk
 lesson_id           uuid fk -> grammar_lessons.id
-topic_id            uuid fk -> grammar_topics.id
+topic_id            uuid null fk -> grammar_topics.id
 exercise_type       varchar not null      -- mcq_single/fill_blank/matching
 question_text       text not null
 explanation         text
@@ -722,7 +757,12 @@ created_at          timestamptz
 updated_at          timestamptz
 ```
 
-#### 5.2.13. `grammar_exercise_options`
+Rules / invariants:
+
+- nếu `lesson_id` khác null thì `topic_id` phải null hoặc phải khớp với `grammar_lessons.topic_id`
+- nếu cần exercise reusable ở cấp topic, cho phép `lesson_id = null` và `topic_id != null`
+
+#### 5.2.14. `grammar_exercise_options`
 
 ```text
 id                  uuid pk
@@ -738,20 +778,20 @@ Rules / indexes:
 - với `exercise_type = mcq_single`, chỉ cho phép tối đa 1 option `is_correct = true`
 - khuyến nghị triển khai bằng partial unique index hoặc trigger, không chỉ dựa vào service validation
 
-#### 5.2.14. `grammar_attempts`
+#### 5.2.15. `grammar_attempts`
 
 ```text
 id                  uuid pk
 user_id             uuid fk -> users.id
 exercise_id         uuid fk -> grammar_exercises.id
 answer_text         text
-selected_option_id  uuid null
+selected_option_id  uuid null fk -> grammar_exercise_options.id
 is_correct          boolean
 answered_at         timestamptz
 created_at          timestamptz
 ```
 
-#### 5.2.15. `reading_documents`
+#### 5.2.16. `reading_documents`
 
 ```text
 id                  uuid pk
@@ -759,24 +799,22 @@ title               varchar not null
 slug                varchar unique not null
 description         text
 is_bilingual        boolean default true
-display_mode        varchar default 'docs'   -- docs/swipe/toggle
+default_display_mode varchar default 'docs'   -- default hint cho viewer
 level               varchar
 status              varchar not null default 'draft'   -- draft/published/archived
 latest_import_id    uuid null fk -> imports.id
 draft_revision_id   uuid null fk -> content_revisions.id
-published_revision_id uuid null fk -> content_revisions.id
-published_at        timestamptz null
-published_by        uuid null fk -> users.id
+active_publication_id uuid null fk -> publications.id
 created_at          timestamptz
 updated_at          timestamptz
+version             integer not null default 1
 ```
 
-#### 5.2.16. `reading_sections`
+#### 5.2.17. `reading_sections`
 
 ```text
 id                  uuid pk
-document_id         uuid fk -> reading_documents.id
-revision_id         uuid fk -> content_revisions.id
+publication_id      uuid fk -> publications.id
 section_order       integer default 0
 heading             varchar
 content_en          text
@@ -797,14 +835,14 @@ Lý do tách section:
 
 Unique:
 
-- `unique (document_id, section_order)`
+- `unique (publication_id, section_order)`
 
-#### 5.2.17. `reading_highlights`
+#### 5.2.18. `reading_highlights`
 
 ```text
 id                  uuid pk
-document_id         uuid fk -> reading_documents.id
-section_id          uuid fk -> reading_sections.id
+publication_id      uuid fk -> publications.id
+section_order       integer not null
 keyword             varchar not null
 color               varchar default 'yellow'
 start_index         integer null
@@ -821,13 +859,15 @@ Notes:
   - dùng keyword text
   - nâng cấp sang range-based nếu sau này có yêu cầu chính xác cao
 
-#### 5.2.18. `reading_progress`
+#### 5.2.19. `reading_progress`
 
 ```text
 id                  uuid pk
 user_id             uuid fk -> users.id
 document_id         uuid fk -> reading_documents.id
-last_section_id     uuid null
+last_section_id     uuid null fk -> reading_sections.id
+last_section_order  integer default 0
+publication_id      uuid null fk -> publications.id
 completion_percent  numeric(5,2) default 0
 last_read_at        timestamptz
 created_at          timestamptz
@@ -839,7 +879,7 @@ Unique:
 
 - `unique (user_id, document_id)`
 
-#### 5.2.19. `imports`
+#### 5.2.20. `imports`
 
 ```text
 id                  uuid pk
@@ -847,12 +887,16 @@ module_name         varchar not null      -- grammar/reading/vocabulary
 source_type         varchar not null      -- markdown/text/csv/json
 source_name         varchar
 source_checksum     varchar
-status              varchar not null      -- uploaded/validated/queued/committed/failed
+source_artifact_url text null
+source_inline_text  text null
+status              varchar not null      -- uploaded/validated/validation_failed/commit_queued/committed/commit_failed/cancelled
 total_records       integer default 0
 success_records     integer default 0
 failed_records      integer default 0
 preview_payload     jsonb
 validation_report   jsonb
+preview_artifact_url text null
+validation_artifact_url text null
 validated_at        timestamptz null
 started_at          timestamptz
 finished_at         timestamptz null
@@ -865,8 +909,11 @@ Purpose:
 - tránh import trùng ngoài ý muốn
 - preview trước commit
 - lưu validation report để debug nhanh
+- source của import phải rõ ràng: file artifact hoặc inline text
+- payload/report lớn nên chuyển sang artifact storage thay vì nhồi hết vào DB
+- đúng một trong hai field `source_artifact_url` hoặc `source_inline_text` nên được set
 
-#### 5.2.20. `import_errors`
+#### 5.2.21. `import_errors`
 
 ```text
 id                  uuid pk
@@ -877,7 +924,7 @@ payload             jsonb
 created_at          timestamptz
 ```
 
-#### 5.2.21. `content_revisions`
+#### 5.2.22. `content_revisions`
 
 ```text
 id                  uuid pk
@@ -901,15 +948,53 @@ Notes:
 - `parsed_payload_json` là canonical structure sau parse/normalize
 - với vocabulary ở MVP, có thể lưu full draft dataset ở cấp `vocab_book` revision; nếu payload quá lớn thì phase sau tối ưu thêm
 
-#### 5.2.22. `jobs`
+#### 5.2.23. `publications`
+
+```text
+id                  uuid pk
+entity_type         varchar not null      -- vocab_book/grammar_lesson/reading_document
+entity_id           uuid not null
+revision_id         uuid not null fk -> content_revisions.id
+action_type         varchar not null      -- publish/unpublish/rollback
+status              varchar not null      -- active/superseded/reverted
+change_summary      text not null
+created_by          uuid fk -> users.id
+created_at          timestamptz
+```
+
+Rules / indexes:
+
+- chỉ có tối đa 1 publication `status = active` cho mỗi `(entity_type, entity_id)`
+- learner read path resolve từ `active_publication_id` -> `publications.revision_id`
+
+#### 5.2.24. `content_audit_logs`
+
+```text
+id                  uuid pk
+actor_id            uuid fk -> users.id
+action_type         varchar not null      -- import_commit/publish/unpublish/rollback
+entity_type         varchar not null
+entity_id           uuid not null
+revision_id         uuid null fk -> content_revisions.id
+publication_id      uuid null fk -> publications.id
+metadata_json       jsonb null
+created_at          timestamptz
+```
+
+#### 5.2.25. `jobs`
 
 ```text
 id                  uuid pk
 job_type            varchar not null      -- import_commit/publish/unpublish/rollback
-status              varchar not null      -- queued/running/succeeded/failed/cancelled
+status              varchar not null      -- queued/running/succeeded/failed/cancelled/dead_lettered
 payload_json        jsonb not null
 attempt_count       integer default 0
 max_attempts        integer default 5
+dedupe_key          varchar null
+next_run_at         timestamptz not null default now()
+lease_until         timestamptz null
+last_heartbeat_at   timestamptz null
+dead_letter_reason  text null
 error_message       text null
 created_by          uuid null fk -> users.id
 started_at          timestamptz null
@@ -918,7 +1003,29 @@ created_at          timestamptz
 updated_at          timestamptz
 ```
 
-#### 5.2.23. `idempotency_keys`
+Rules / indexes:
+
+- worker chỉ được claim job khi `next_run_at <= now()` và lease còn trống/hết hạn
+- `dedupe_key` nên có unique/partial index phù hợp để chặn enqueue trùng ngoài ý muốn
+
+#### 5.2.26. `job_attempts`
+
+```text
+id                  uuid pk
+job_id              uuid fk -> jobs.id
+attempt_no          integer not null
+worker_id           varchar null
+started_at          timestamptz
+finished_at         timestamptz null
+error_message       text null
+created_at          timestamptz
+```
+
+Unique:
+
+- `unique (job_id, attempt_no)`
+
+#### 5.2.27. `idempotency_keys`
 
 ```text
 id                  uuid pk
@@ -933,7 +1040,7 @@ created_at          timestamptz
 unique (actor_id, scope, idempotency_key)
 ```
 
-#### 5.2.24. `auth_events`
+#### 5.2.28. `auth_events`
 
 ```text
 id                  uuid pk
@@ -949,13 +1056,15 @@ created_at          timestamptz
 ### 5.3. Nguyên tắc schema quan trọng
 
 - dùng một nguồn sự thật cho publish state: `status`, không giữ thêm `is_published` song song
-- `published_at` và `published_by` chỉ có giá trị khi `status = published`
 - `imports.preview_payload` chỉ nên lưu dữ liệu preview vừa phải; nếu payload lớn, chuyển sang artifact storage và chỉ lưu reference
-- learner read path chỉ resolve từ `published_revision_id`
-- `content_revisions` là nguồn sự thật cho draft/live history; các bảng như `vocab_words` và `reading_sections` có thể là published projection để tối ưu learner reads
-- thêm CHECK constraints cho các enum-like fields: `status`, `learning_status`, `direction`, `ordering`, `display_mode`
-- thêm composite/partial indexes cho query nóng: published content, active sessions, non-revoked sessions
-- thêm invariant ở DB khi phù hợp, ví dụ: `status = published => published_at is not null`
+- `content_revisions` là nguồn sự thật cho draft/source history
+- `publications` là nguồn sự thật cho live history
+- learner tables chỉ chứa published projection bất biến theo `publication_id`
+- learner read path resolve từ `active_publication_id` -> `publications.revision_id`
+- `imports` phải chỉ rõ source là artifact hay inline text; nếu preview/report lớn thì dùng artifact URLs
+- thêm CHECK constraints cho các enum-like fields: `status`, `learning_status`, `direction`, `ordering`, `default_display_mode`
+- thêm composite/partial indexes cho query nóng: active publications, active sessions, non-revoked sessions, queued jobs
+- thêm invariant ở DB khi phù hợp, ví dụ: `status = published => active_publication_id is not null`
 - khai báo rõ `ON DELETE` strategy cho các quan hệ chính thay vì để implicit
 - các mutation từ client phải có idempotency boundary rõ ràng
 
@@ -967,16 +1076,17 @@ users 1---n vocab_study_sessions
 users 1---n user_vocab_progress
 users 1---n grammar_attempts
 users 1---n reading_progress
-users 1---n vocab_books (published_by)
-users 1---n grammar_lessons (published_by)
-users 1---n reading_documents (published_by)
 users 1---n jobs (created_by)
 users 1---n auth_events
+users 1---n publications (created_by)
+users 1---n content_audit_logs (actor_id)
 
 vocab_books 1---n vocab_words
 vocab_books 1---n content_revisions
+vocab_books 1---n publications
 vocab_words 1---n vocab_word_examples
 vocab_words 1---n vocab_word_media
+vocab_study_sessions 1---n vocab_session_items
 vocab_study_sessions 1---n vocab_quiz_attempts
 
 grammar_topics 1---n grammar_lessons
@@ -984,12 +1094,15 @@ grammar_topics 1---n grammar_exercises
 grammar_lessons 1---n grammar_exercises
 grammar_exercises 1---n grammar_exercise_options
 grammar_lessons 1---n content_revisions
+grammar_lessons 1---n publications
 
-reading_documents 1---n reading_sections
-reading_documents 1---n reading_highlights
 reading_documents 1---n content_revisions
-content_revisions 1---n reading_sections
+reading_documents 1---n publications
+publications 1---n reading_sections
+publications 1---n reading_highlights
 imports 1---n content_revisions
+content_revisions 1---n publications
+publications 1---n content_audit_logs
 ```
 
 ## 7. API design
@@ -1004,6 +1117,7 @@ imports 1---n content_revisions
 - các resource mutable nên trả `version` hoặc `ETag` để hỗ trợ optimistic concurrency
 - published learner content endpoints nên hỗ trợ `ETag` / `Last-Modified`
 - list/history lớn nên ưu tiên cursor pagination ngoài `page/limit`
+- publish/rollback requests nên kèm `change_summary` và precondition check phù hợp
 - response format thống nhất:
 
 ```json
@@ -1121,6 +1235,7 @@ Query params ví dụ:
 - `POST /api/v1/vocab/books/:bookId/sessions`
 - `GET /api/v1/vocab/sessions/:sessionId`
 - `GET /api/v1/vocab/sessions/:sessionId/next`
+- `GET /api/v1/vocab/sessions/:sessionId/items/:questionSeq`
 - `POST /api/v1/vocab/sessions/:sessionId/answer`
 - `POST /api/v1/vocab/sessions/:sessionId/complete`
 - `GET /api/v1/vocab/sessions/resume?book_id=...`
@@ -1139,12 +1254,19 @@ Request ví dụ:
 }
 ```
 
+Answer submit nên mang theo:
+
+- `session_item_id`
+- `Idempotency-Key`
+
 Response ví dụ cho `next`:
 
 ```json
 {
   "success": true,
   "data": {
+    "session_item_id": "uuid",
+    "question_seq": 7,
     "word_id": "uuid",
     "prompt": "abandon",
     "ipa": "/əˈbændən/",
@@ -1165,6 +1287,7 @@ Response ví dụ cho `answer`:
 {
   "success": true,
   "data": {
+    "session_item_id": "uuid",
     "is_correct": true,
     "correct_answer": "abandon",
     "updated_progress": {
@@ -1201,11 +1324,11 @@ Response ví dụ cho `answer`:
 Response nên gồm:
 
 - metadata
-- source markdown
 - parsed blocks
 - rendered content
 - keywords highlight
 - related exercises
+- publication metadata (`publication_id`, `revision_id`, `published_at`, `etag`)
 
 #### Exercises
 
@@ -1237,10 +1360,18 @@ Request ví dụ:
 
 ```json
 {
+  "base_version": 3,
+  "publication_id": "uuid",
   "last_section_id": "uuid",
+  "last_section_order": 12,
   "completion_percent": 42.5
 }
 ```
+
+Rules:
+
+- server chỉ chấp nhận update nếu `base_version` còn mới
+- `publication_id` phải khớp active publication hoặc policy migrate progress đã được định nghĩa rõ
 
 #### Admin import / publish
 
@@ -1253,7 +1384,7 @@ Request ví dụ:
 
 Notes:
 
-- learner endpoints chỉ resolve từ `published_revision_id`
+- learner endpoints chỉ resolve từ `active_publication_id`
 - preview/draft chỉ có ở admin routes
 
 ### 7.7. Admin ops utility endpoints
@@ -1261,12 +1392,16 @@ Notes:
 - `GET /api/v1/admin/imports`
 - `GET /api/v1/admin/imports/:importId`
 - `GET /api/v1/admin/jobs/:jobId`
+- `GET /api/v1/admin/publications?entity_type=...&entity_id=...`
+- `GET /api/v1/admin/content/diff?entity_type=...&entity_id=...&target_revision_id=...`
 
 Mục đích:
 
 - xem import history
 - xem validation report cũ
 - theo dõi commit/publish jobs
+- xem publication history của từng content entity
+- xem diff live vs revision trước publish
 - debug import lỗi nhanh hơn
 
 ### 7.8. Swagger coverage
@@ -1425,6 +1560,8 @@ Admin Import Page
   -> fix lỗi nếu có
   -> commit (enqueue job)
   -> theo dõi job status
+  -> xem diff live vs revision mới
+  -> nhập change summary
   -> publish
 ```
 
@@ -1463,6 +1600,8 @@ Admin Import Page
   -> kiểm tra section pairing EN/VI
   -> commit (enqueue job)
   -> theo dõi job status
+  -> xem diff live vs revision mới
+  -> nhập change summary
   -> publish
 ```
 
@@ -1605,6 +1744,7 @@ Dùng Zustand hoặc React Context cho:
 - flashcard local state
 - study settings
 - reading viewer preferences
+- display mode preference theo device/user
 - theme / font size / highlight toggle
 - resume session info
 - admin import draft state
@@ -1669,7 +1809,8 @@ Upload Markdown
   -> enqueue commit job
   -> tạo draft revision
   -> link topic/exercises
-  -> publish/unpublish qua publish job
+  -> xem diff live vs draft revision
+  -> publish/unpublish qua publish job + change summary
 ```
 
 ### 11.2. Reading import từ Markdown/text
@@ -1680,7 +1821,7 @@ Markdown format gợi ý:
 ---
 title: A Visit to Da Lat
 slug: a-visit-to-da-lat
-display_mode: docs
+default_display_mode: docs
 is_bilingual: true
 ---
 
@@ -1725,8 +1866,9 @@ Upload file
   -> validation report
   -> enqueue commit job
   -> tạo draft revision
-  -> materialize sections khi publish
-  -> publish/unpublish qua publish job
+  -> materialize sections/highlights theo `publication_id` khi publish
+  -> xem diff live vs draft revision
+  -> publish/unpublish qua publish job + change summary
 ```
 
 ### 11.3. Vocabulary import từ CSV/JSON
@@ -1749,7 +1891,8 @@ Upload file
   -> commit vào draft revision / draft dataset
   -> validation report
   -> materialize `vocab_words` / examples / media khi publish
-  -> publish/unpublish book
+  -> xem diff live vs draft revision
+  -> publish/unpublish book + change summary
   -> thống kê success/failed rows
 ```
 
@@ -1757,6 +1900,7 @@ Upload file
 
 - preview trước commit
 - publish là bước tách riêng sau commit
+- import source phải là uploaded artifact hoặc inline text có lưu dấu vết rõ ràng
 - giới hạn file size
 - kiểm tra MIME type
 - ghi `import_errors` đủ chi tiết để sửa được
@@ -1765,6 +1909,7 @@ Upload file
 - commit/publish nên chạy qua background jobs để tránh timeout và double-submit
 - UI phải poll `job status` hoặc có cơ chế theo dõi tương đương
 - retry commit/publish phải idempotent
+- preview/report lớn nên đẩy sang artifact storage và chỉ giữ reference trong DB
 
 ## 12. Business rules
 
@@ -1795,8 +1940,9 @@ Rules:
 - MCQ phải tránh 4 options trùng hoặc quá dễ phân biệt
 - learner app chỉ hiển thị books có `status = published`
 - import thành công không tự động làm book live; publish là bước tách riêng
-- learner reads của vocabulary đi qua published projection được build từ `published_revision_id`
+- learner reads của vocabulary đi qua published projection được build từ `active_publication_id`
 - answer submit phải retry-safe khi client retry sau lỗi mạng ngắn
+- câu hỏi đã phát ra phải được snapshot qua `vocab_session_items` để resume/retry deterministic
 
 Logic cập nhật trạng thái đề xuất:
 
@@ -1816,7 +1962,7 @@ Ví dụ rule:
 - exercise có thể gắn với topic và lesson
 - keyword highlight phải parse được từ markdown/frontmatter
 - learner app chỉ hiển thị lesson có `status = published`
-- learner chỉ đọc `published_revision_id`, không đọc draft revision
+- learner chỉ đọc active publication, không đọc draft/source revision
 - publish phải trỏ sang revision đã validate
 - rollback không được làm mất lịch sử revision
 
@@ -1826,17 +1972,19 @@ Ví dụ rule:
 - tài liệu dài phải tách sections
 - progress lưu theo section cuối cùng đã đọc
 - section pairing lỗi phải block publish
-- learner chỉ đọc `published_revision_id`
+- learner chỉ đọc active publication
 - section API phải hỗ trợ load theo cửa sổ cho tài liệu dài
+- progress update phải gửi `base_version`, `publication_id`, `last_section_order` để chặn stale overwrite
 
 ### 12.5. Content ops
 
 - import preview lỗi không được commit một phần âm thầm
 - publish chỉ hợp lệ khi validation pass
 - unpublish không được làm mất lịch sử import
-- publish phải trỏ sang một `published_revision_id` bất biến, không overwrite trực tiếp bản live
+- publish phải tạo publication record mới và cập nhật `active_publication_id`, không overwrite trực tiếp live history
 - cần hỗ trợ rollback sang revision đã publish trước đó
 - commit/publish là job-backed operations có retry và auditability rõ ràng
+- diff preview và change summary là guardrail mặc định trước publish/rollback
 
 ## 13. Error handling strategy
 
@@ -1945,6 +2093,12 @@ Khi render Markdown:
 - không cho client ghi trực tiếp bucket public không kiểm soát
 - dùng CDN/object storage cho asset tĩnh để giảm tải app server
 
+### 14.5. Admin-sensitive actions
+
+- publish/unpublish/rollback nên yêu cầu recent re-auth hoặc equivalent step-up auth nếu deployment model có privileged admin accounts
+- mọi live content change phải có `change_summary`
+- mọi live content change phải ghi `content_audit_logs`
+
 ## 15. Performance strategy
 
 ### 15.1. Backend
@@ -1995,6 +2149,8 @@ Test cho:
 - refresh token rotation logic
 - parser fuzz tests cho markdown/reading section parsing
 - strategy determinism tests cho random/sequential/repeat
+- publication activation / supersede / rollback logic
+- job lease / heartbeat / retry scheduler logic
 
 #### Integration tests
 
@@ -2008,6 +2164,8 @@ Dùng PostgreSQL test DB hoặc container:
 - get reading sections
 - publish/unpublish flow
 - revoke session flow
+- rollback flow không làm leak draft sang learner
+- job worker crash rồi recover không chạy đôi cùng một publish job
 
 #### API tests
 
@@ -2047,6 +2205,11 @@ Gợi ý công cụ:
 - ReadingSectionCard
 - ImportPreviewPanel
 
+#### Contract / client sync
+
+- generated TypeScript client từ OpenAPI
+- contract tests để phát hiện drift giữa backend spec và frontend usage
+
 #### E2E tests
 
 - login thành công/thất bại
@@ -2058,6 +2221,7 @@ Gợi ý công cụ:
 - import preview -> commit -> publish
 - submit answer lỗi mạng nhưng không mất input
 - reading progress lỗi mạng ngắn rồi replay thành công
+- learner không nhìn thấy draft revision chưa publish
 
 Gợi ý công cụ:
 
@@ -2077,14 +2241,18 @@ Gợi ý công cụ:
   - wrong/correct answer flow
   - resume session
   - summary cuối phiên
+  - same session resume vẫn thấy đúng câu hỏi/options đã phát ra
 - Grammar:
   - import preview
   - validation errors
   - publish lesson
+  - diff preview + change summary trước publish
+  - publication history / rollback
 - Reading:
   - section pairing
   - desktop 2-pane
   - mobile language toggle
+  - progress gửi version/publication_id đúng
 - Ops:
   - `healthz` / `readyz`
   - migrate up/down
@@ -2115,6 +2283,7 @@ Gợi ý công cụ:
 - repeat mode lặp lại từ sai nhiều hơn
 - session summary tính đúng accuracy
 - retry submit answer không tạo duplicate attempt
+- resume session vẫn giữ đúng prompt/options đã phát cho mỗi `question_seq`
 
 ### 17.3. Grammar
 
@@ -2124,6 +2293,8 @@ Gợi ý công cụ:
 - render highlight đúng từ khóa
 - submit exercise lưu attempt
 - lesson draft không lộ ra learner API
+- `selected_option_id` luôn trỏ tới option hợp lệ
+- topic-level exercise và lesson-level exercise không drift topic
 
 ### 17.4. Reading
 
@@ -2134,6 +2305,7 @@ Gợi ý công cụ:
 - progress update đúng section cuối
 - section pairing lỗi thì không publish được
 - replay pending progress sau lỗi mạng không ghi đè sai progress mới hơn
+- rollback publication không làm highlight trỏ nhầm sang section khác
 
 ## 18. Logging, monitoring, observability
 
@@ -2150,7 +2322,9 @@ Backend nên log:
 - `user_id`
 - `session_id`
 - `job_id`
+- `worker_id`
 - `import_id`
+- `publication_id`
 - `error_code`
 
 Không log:
@@ -2172,8 +2346,10 @@ Theo dõi:
 - publish failure rate
 - DB connection saturation
 - job retry rate
+- dead-letter job rate
 - import/publish completion latency
 - offline replay failure rate
+- API contract drift failure rate trong CI
 
 ### 18.3. Product success metrics
 
@@ -2207,7 +2383,8 @@ backend/
 │   │   ├── user.go
 │   │   ├── vocab.go
 │   │   ├── grammar.go
-│   │   └── reading.go
+│   │   ├── reading.go
+│   │   └── publication.go
 │   ├── queries/
 │   ├── policies/
 │   ├── dto/
@@ -2222,7 +2399,10 @@ backend/
 │   │   ├── grammar_repository.go
 │   │   ├── reading_repository.go
 │   │   ├── import_repository.go
+│   │   ├── publication_repository.go
+│   │   ├── audit_repository.go
 │   │   ├── job_repository.go
+│   │   ├── job_attempt_repository.go
 │   │   ├── idempotency_repository.go
 │   │   └── auth_event_repository.go
 │   ├── services/
@@ -2353,6 +2533,7 @@ Exit criteria:
   - async commit/publish jobs
   - import/publish idempotency
   - revision history tối thiểu
+  - publication history + content audit logs
 
 Exit criteria:
 
@@ -2370,6 +2551,7 @@ Exit criteria:
 - baseline reliability cho learner writes:
   - answer submission idempotency
   - local draft / pending queue cho write mode
+  - deterministic session items cho vocab
 
 Exit criteria:
 
@@ -2400,6 +2582,8 @@ Exit criteria:
 ### Phase 6: Hardening, scale & deployment
 
 - E2E smoke tests
+- API contract tests
+- generated client sync check trong CI
 - observability
 - performance optimization
 - asset storage/CDN
@@ -2425,8 +2609,10 @@ Exit criteria:
 - resume session
 - admin import preview + commit + publish cho grammar/reading/vocab
 - revisioned publish flow cho grammar/reading
+- publication history + content audit logs cho content ops
 - async commit/publish jobs cơ bản
 - idempotency cho learner/admin writes quan trọng
+- deterministic session items cho vocabulary
 - Docker Compose + migrations + seed data
 - `healthz` / `readyz` + logging cơ bản
 
@@ -2443,6 +2629,7 @@ Exit criteria:
 
 - admin import preview/publish là một phần của MVP, không phải nice-to-have
 - nếu không có content ops vận hành được, learner product sẽ dừng ở mức demo
+- không mở thêm product surfaces lớn cho tới khi vòng `import -> validate -> publish -> learner consume -> progress/retry-safe` ổn định
 
 ## 23. Rủi ro kỹ thuật và cách xử lý
 
@@ -2545,7 +2732,7 @@ Rủi ro:
 Giải pháp:
 
 - dùng `content_revisions`
-- publish chỉ đổi `published_revision_id`
+- publish tạo publication record mới rồi cập nhật `active_publication_id`
 - rollback về revision cũ mà không mất lịch sử
 
 ### 23.9. Retry/double-submit làm sai progress hoặc duplicate import
@@ -2560,6 +2747,29 @@ Giải pháp:
 - optimistic concurrency cho resource mutable
 - background jobs có retry có kiểm soát
 
+### 23.10. Job bị kẹt hoặc bị nhiều worker chạy trùng
+
+Rủi ro:
+
+- worker chết giữa chừng hoặc 2 worker cùng claim một job có thể làm publish/import chạy đôi hoặc kẹt `running`
+
+Giải pháp:
+
+- jobs có `lease_until`, `last_heartbeat_at`, `next_run_at`, `dedupe_key`
+- lưu `job_attempts` để debug retry/failure rõ ràng
+- có cơ chế requeue hoặc dead-letter cho job lỗi lặp lại
+
+### 23.11. Reading progress bị stale overwrite sau publish mới hoặc replay muộn
+
+Rủi ro:
+
+- client replay progress cũ có thể ghi đè progress mới hơn nếu không gửi publication/version context
+
+Giải pháp:
+
+- PATCH progress phải kèm `base_version`, `publication_id`, `last_section_order`
+- server từ chối update stale bằng precondition check rõ ràng
+
 ## 24. Kết luận kiến trúc đề xuất
 
 Kiến trúc phù hợp nhất cho dự án này là:
@@ -2572,8 +2782,9 @@ Kiến trúc phù hợp nhất cho dự án này là:
 - import pipeline riêng cho Markdown/text/CSV với `preview -> commit -> publish`
 - commit/publish đi qua background jobs khi operation dài hoặc nặng
 - session-based learning logic cho Vocabulary
+- deterministic session model cho Vocabulary qua `vocab_session_items`
 - section-based content model cho Reading
-- revisioned content lifecycle cho content modules, với trọng tâm grammar/reading và book-level draft/live lifecycle rõ ràng cho vocabulary
+- revisioned content lifecycle cho source history + publication model riêng cho live history
 - auth hybrid: access token in-memory + refresh token HttpOnly cookie
 - idempotency và optimistic concurrency cho write paths quan trọng
 - Swagger/OpenAPI + migrations + Docker Compose + CI-ready delivery
@@ -2589,5 +2800,6 @@ Cách tổ chức này có các ưu điểm:
 - triển khai thật nhanh hơn
 - an toàn hơn về session/auth
 - vận hành nội dung thực tế tốt hơn
+- boundary giữa draft/source history và live history rõ hơn
 - giảm overwrite nhầm, retry lỗi và race conditions ở các write path
 - giảm rủi ro "demo chạy được nhưng đội không ship nổi"

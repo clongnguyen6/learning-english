@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "purpose": "Reproducible local QA and demo fixtures for learning-english.",
+  "current_reality": {
+    "automated_loader_available": false,
+    "notes": [
+      "The backend shell and auth schema are still landing.",
+      "These files are the canonical fixture corpus for future seed loaders and admin import smoke flows."
+    ]
+  },
+  "auth": {
+    "path": "auth/users.json",
+    "records": 3
+  },
+  "imports": [
+    {
+      "module": "vocabulary",
+      "format": "csv",
+      "path": "imports/vocabulary/travel-basics.csv",
+      "intended_flow": [
+        "preview",
+        "commit",
+        "publish"
+      ],
+      "expected_records": {
+        "rows": 6
+      },
+      "notes": [
+        "Happy-path vocabulary book import.",
+        "Chosen as CSV only for now because PLAN.md does not yet define a canonical JSON import payload."
+      ]
+    },
+    {
+      "module": "grammar",
+      "format": "markdown",
+      "path": "imports/grammar/present-perfect.md",
+      "intended_flow": [
+        "preview",
+        "commit",
+        "publish"
+      ],
+      "expected_records": {
+        "lesson": 1,
+        "keywords": 4
+      },
+      "notes": [
+        "Happy-path grammar lesson with frontmatter, lists, examples, and inline code.",
+        "Useful later for preview rendering and keyword highlight verification."
+      ]
+    },
+    {
+      "module": "reading",
+      "format": "markdown",
+      "path": "imports/reading/a-visit-to-da-lat.md",
+      "intended_flow": [
+        "preview",
+        "commit",
+        "publish"
+      ],
+      "expected_records": {
+        "sections": 3,
+        "languages": 2
+      },
+      "notes": [
+        "Primary bilingual markdown reading fixture for docs-mode rendering."
+      ]
+    },
+    {
+      "module": "reading",
+      "format": "plain_text",
+      "path": "imports/reading/street-food-weekend.txt",
+      "intended_flow": [
+        "preview",
+        "commit",
+        "publish"
+      ],
+      "expected_records": {
+        "sections": 3,
+        "languages": 2
+      },
+      "notes": [
+        "Edge-case fixture for the alternate plain-text parser path.",
+        "Keeps section pairing valid while stressing punctuation and named entities."
+      ],
+      "edge_case": true
+    }
+  ],
+  "smoke_flows": [
+    {
+      "name": "admin-content-ops-happy-path",
+      "artifacts": [
+        "imports/vocabulary/travel-basics.csv",
+        "imports/grammar/present-perfect.md",
+        "imports/reading/a-visit-to-da-lat.md"
+      ]
+    },
+    {
+      "name": "reading-plain-text-parser-path",
+      "artifacts": [
+        "imports/reading/street-food-weekend.txt"
+      ]
+    }
+  ]
+}
