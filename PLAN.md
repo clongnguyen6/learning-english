@@ -56,6 +56,7 @@ Xây dựng một website học tiếng Anh với 4 module chính:
 - GORM
 - Swagger/OpenAPI
 - clean layered architecture: handler -> service -> repository
+- bổ sung `policies`, `queries`, `jobs` như các package phụ trợ, nhưng vẫn giữ layered architecture làm trục chính
 
 #### Database
 
@@ -106,6 +107,7 @@ Xây dựng một website học tiếng Anh với 4 module chính:
 - các thao tác CRUD/import/publish nằm sau admin APIs thay vì trộn vào learner flows
 - ưu tiên ship một "content-to-learning loop" hoàn chỉnh hơn là nhiều feature rời rạc
 - chỉ chọn các tối ưu thật sự tăng xác suất triển khai, test, deploy và vận hành thành công
+- learner read path chỉ đọc published snapshot, không đọc draft hoặc mutable state đang chỉnh sửa
 
 ## 3. Kiến trúc hệ thống
 
@@ -123,6 +125,7 @@ Xây dựng một website học tiếng Anh với 4 module chính:
    - services
    - repositories
    - import service
+   - job dispatcher
    - progress tracking
    - admin content ops
    - asset storage abstraction
@@ -138,6 +141,9 @@ Xây dựng một website học tiếng Anh với 4 module chính:
    - grammar
    - reading
    - imports
+   - content revisions
+   - jobs
+   - auth events
 ```
 
 ### 3.2. Kiến trúc backend đề xuất
@@ -169,11 +175,14 @@ learning-english/
   /middleware
   /models
   /repositories
+  /queries
+  /policies
   /services
   /handlers
   /dto
   /utils
   /importers
+  /jobs
   /storage
   /router
   /swagger
@@ -187,10 +196,13 @@ learning-english/
 - handlers: nhận request/response HTTP, mapping DTO, translate error
 - services: business logic, orchestration, transaction boundary
 - repositories: truy cập DB qua GORM
+- queries: read-model/query tối ưu cho dashboard, reading docs, admin history
+- policies: authorization rules, publish rules, validation gates
 - models: entity DB
 - dto: request/response schema
 - middleware: auth, logging, recovery, CORS, request ID
 - importers: parse Markdown/text/CSV thành dữ liệu có cấu trúc
+- jobs: background workers cho commit/publish/unpublish và retry
 - storage: upload, signed URL, asset metadata
 - router: phân vùng public/private/admin routes
 
@@ -464,6 +476,10 @@ Reading content phải lưu theo sections để:
 
 - imports
 - import_errors
+- content_revisions
+- jobs
+- idempotency_keys
+- auth_events
 
 ### 5.2. Database schema chi tiết
 
@@ -498,6 +514,8 @@ user_agent          text
 ip_address          inet
 expires_at          timestamptz
 revoked_at          timestamptz null
+last_used_at        timestamptz null
+replaced_by_session_id uuid null fk -> user_sessions.id
 created_at          timestamptz
 updated_at          timestamptz
 ```
@@ -507,7 +525,7 @@ Purpose:
 - quản lý refresh token
 - logout từng thiết bị hoặc toàn bộ
 - phục vụ refresh token rotation
-- để sẵn đường cho reuse detection nếu cần
+- hỗ trợ refresh token reuse detection như một phần chính thức của session model
 
 #### 5.2.3. `vocab_books`
 
@@ -521,7 +539,9 @@ level               varchar
 language_from       varchar default 'en'
 language_to         varchar default 'vi'
 status              varchar not null default 'draft'   -- draft/published/archived
-import_id           uuid null fk -> imports.id
+latest_import_id    uuid null fk -> imports.id
+draft_revision_id   uuid null fk -> content_revisions.id
+published_revision_id uuid null fk -> content_revisions.id
 word_count          integer default 0
 sort_order          integer default 0
 published_at        timestamptz null
@@ -553,7 +573,7 @@ updated_at          timestamptz
 Indexes:
 
 - `(book_id, sort_order)`
-- `(book_id, normalized_word)`
+- `unique (book_id, normalized_word)`
 
 #### 5.2.5. `vocab_word_examples`
 
@@ -601,6 +621,7 @@ next_review_at      timestamptz null
 is_favorite         boolean default false
 created_at          timestamptz
 updated_at          timestamptz
+version             integer not null default 1
 ```
 
 Unique:
@@ -631,6 +652,7 @@ total_items         integer default 0
 completed_items     integer default 0
 created_at          timestamptz
 updated_at          timestamptz
+version             integer not null default 1
 ```
 
 #### 5.2.9. `vocab_quiz_attempts`
@@ -646,7 +668,12 @@ answer_text         text
 selected_option     text
 is_correct          boolean
 answered_at         timestamptz
+question_seq        integer not null
 ```
+
+Unique:
+
+- `unique (session_id, question_seq)`
 
 #### 5.2.10. `grammar_topics`
 
@@ -668,28 +695,16 @@ id                  uuid pk
 topic_id            uuid fk -> grammar_topics.id
 title               varchar not null
 slug                varchar unique not null
-source_type         varchar not null      -- markdown
-source_path         text
-content_markdown    text not null
-rendered_html       text                  -- optional cached derivative
 summary             text
-keywords_json       jsonb
 status              varchar not null default 'draft'   -- draft/published/archived
-import_id           uuid null fk -> imports.id
+latest_import_id    uuid null fk -> imports.id
+draft_revision_id   uuid null fk -> content_revisions.id
+published_revision_id uuid null fk -> content_revisions.id
 published_at        timestamptz null
 published_by        uuid null fk -> users.id
 sort_order          integer default 0
 created_at          timestamptz
 updated_at          timestamptz
-```
-
-`keywords_json` ví dụ:
-
-```json
-[
-  { "text": "present perfect", "color": "yellow" },
-  { "text": "have/has + V3", "color": "yellow" }
-]
 ```
 
 #### 5.2.12. `grammar_exercises`
@@ -698,7 +713,7 @@ updated_at          timestamptz
 id                  uuid pk
 lesson_id           uuid fk -> grammar_lessons.id
 topic_id            uuid fk -> grammar_topics.id
-exercise_type       varchar not null      -- mcq/fill_blank/matching
+exercise_type       varchar not null      -- mcq_single/fill_blank/matching
 question_text       text not null
 explanation         text
 difficulty          varchar
@@ -717,6 +732,11 @@ is_correct          boolean default false
 sort_order          integer default 0
 created_at          timestamptz
 ```
+
+Rules / indexes:
+
+- với `exercise_type = mcq_single`, chỉ cho phép tối đa 1 option `is_correct = true`
+- khuyến nghị triển khai bằng partial unique index hoặc trigger, không chỉ dựa vào service validation
 
 #### 5.2.14. `grammar_attempts`
 
@@ -738,14 +758,13 @@ id                  uuid pk
 title               varchar not null
 slug                varchar unique not null
 description         text
-source_type         varchar not null      -- markdown/plain_text
-source_path         text
-content_raw         text not null
 is_bilingual        boolean default true
 display_mode        varchar default 'docs'   -- docs/swipe/toggle
 level               varchar
 status              varchar not null default 'draft'   -- draft/published/archived
-import_id           uuid null fk -> imports.id
+latest_import_id    uuid null fk -> imports.id
+draft_revision_id   uuid null fk -> content_revisions.id
+published_revision_id uuid null fk -> content_revisions.id
 published_at        timestamptz null
 published_by        uuid null fk -> users.id
 created_at          timestamptz
@@ -757,11 +776,14 @@ updated_at          timestamptz
 ```text
 id                  uuid pk
 document_id         uuid fk -> reading_documents.id
+revision_id         uuid fk -> content_revisions.id
 section_order       integer default 0
 heading             varchar
 content_en          text
 content_vi          text
 keywords_json       jsonb
+blocks_json         jsonb not null
+content_hash        varchar null
 created_at          timestamptz
 updated_at          timestamptz
 ```
@@ -772,6 +794,10 @@ Lý do tách section:
 - render song ngữ theo đoạn
 - hỗ trợ highlight từng section
 - dễ sync scroll hoặc resume
+
+Unique:
+
+- `unique (document_id, section_order)`
 
 #### 5.2.17. `reading_highlights`
 
@@ -806,7 +832,12 @@ completion_percent  numeric(5,2) default 0
 last_read_at        timestamptz
 created_at          timestamptz
 updated_at          timestamptz
+version             integer not null default 1
 ```
+
+Unique:
+
+- `unique (user_id, document_id)`
 
 #### 5.2.19. `imports`
 
@@ -816,7 +847,7 @@ module_name         varchar not null      -- grammar/reading/vocabulary
 source_type         varchar not null      -- markdown/text/csv/json
 source_name         varchar
 source_checksum     varchar
-status              varchar not null      -- pending/validated/committed/failed
+status              varchar not null      -- uploaded/validated/queued/committed/failed
 total_records       integer default 0
 success_records     integer default 0
 failed_records      integer default 0
@@ -846,11 +877,87 @@ payload             jsonb
 created_at          timestamptz
 ```
 
+#### 5.2.21. `content_revisions`
+
+```text
+id                  uuid pk
+entity_type         varchar not null      -- vocab_book/grammar_lesson/reading_document
+entity_id           uuid not null
+version_no          integer not null
+import_id           uuid null fk -> imports.id
+source_type         varchar not null      -- markdown/plain_text/csv/json
+source_payload      text not null
+parsed_payload_json jsonb not null
+keywords_json       jsonb null
+render_artifact_url text null
+change_summary      text null
+created_by          uuid fk -> users.id
+created_at          timestamptz
+unique (entity_type, entity_id, version_no)
+```
+
+Notes:
+
+- `parsed_payload_json` là canonical structure sau parse/normalize
+- với vocabulary ở MVP, có thể lưu full draft dataset ở cấp `vocab_book` revision; nếu payload quá lớn thì phase sau tối ưu thêm
+
+#### 5.2.22. `jobs`
+
+```text
+id                  uuid pk
+job_type            varchar not null      -- import_commit/publish/unpublish/rollback
+status              varchar not null      -- queued/running/succeeded/failed/cancelled
+payload_json        jsonb not null
+attempt_count       integer default 0
+max_attempts        integer default 5
+error_message       text null
+created_by          uuid null fk -> users.id
+started_at          timestamptz null
+finished_at         timestamptz null
+created_at          timestamptz
+updated_at          timestamptz
+```
+
+#### 5.2.23. `idempotency_keys`
+
+```text
+id                  uuid pk
+actor_id            uuid not null fk -> users.id
+scope               varchar not null      -- vocab_answer/reading_progress/import_commit/publish
+idempotency_key     varchar not null
+request_hash        varchar not null
+status              varchar not null      -- started/completed/failed
+response_snapshot   jsonb null
+expires_at          timestamptz null
+created_at          timestamptz
+unique (actor_id, scope, idempotency_key)
+```
+
+#### 5.2.24. `auth_events`
+
+```text
+id                  uuid pk
+user_id             uuid null fk -> users.id
+session_id          uuid null fk -> user_sessions.id
+event_type          varchar not null      -- login_success/login_failed/refresh_reuse/logout/logout_all
+ip_address          inet
+user_agent          text
+metadata            jsonb
+created_at          timestamptz
+```
+
 ### 5.3. Nguyên tắc schema quan trọng
 
 - dùng một nguồn sự thật cho publish state: `status`, không giữ thêm `is_published` song song
 - `published_at` và `published_by` chỉ có giá trị khi `status = published`
 - `imports.preview_payload` chỉ nên lưu dữ liệu preview vừa phải; nếu payload lớn, chuyển sang artifact storage và chỉ lưu reference
+- learner read path chỉ resolve từ `published_revision_id`
+- `content_revisions` là nguồn sự thật cho draft/live history; các bảng như `vocab_words` và `reading_sections` có thể là published projection để tối ưu learner reads
+- thêm CHECK constraints cho các enum-like fields: `status`, `learning_status`, `direction`, `ordering`, `display_mode`
+- thêm composite/partial indexes cho query nóng: published content, active sessions, non-revoked sessions
+- thêm invariant ở DB khi phù hợp, ví dụ: `status = published => published_at is not null`
+- khai báo rõ `ON DELETE` strategy cho các quan hệ chính thay vì để implicit
+- các mutation từ client phải có idempotency boundary rõ ràng
 
 ## 6. Quan hệ dữ liệu chính
 
@@ -863,9 +970,11 @@ users 1---n reading_progress
 users 1---n vocab_books (published_by)
 users 1---n grammar_lessons (published_by)
 users 1---n reading_documents (published_by)
+users 1---n jobs (created_by)
+users 1---n auth_events
 
 vocab_books 1---n vocab_words
-imports 1---n vocab_books
+vocab_books 1---n content_revisions
 vocab_words 1---n vocab_word_examples
 vocab_words 1---n vocab_word_media
 vocab_study_sessions 1---n vocab_quiz_attempts
@@ -874,11 +983,13 @@ grammar_topics 1---n grammar_lessons
 grammar_topics 1---n grammar_exercises
 grammar_lessons 1---n grammar_exercises
 grammar_exercises 1---n grammar_exercise_options
-imports 1---n grammar_lessons
+grammar_lessons 1---n content_revisions
 
 reading_documents 1---n reading_sections
 reading_documents 1---n reading_highlights
-imports 1---n reading_documents
+reading_documents 1---n content_revisions
+content_revisions 1---n reading_sections
+imports 1---n content_revisions
 ```
 
 ## 7. API design
@@ -889,6 +1000,10 @@ imports 1---n reading_documents
 - auth transport:
   - access token: `Authorization: Bearer <token>`
   - refresh token: HttpOnly Secure SameSite cookie
+- mọi request có side effect nên hỗ trợ `Idempotency-Key`
+- các resource mutable nên trả `version` hoặc `ETag` để hỗ trợ optimistic concurrency
+- published learner content endpoints nên hỗ trợ `ETag` / `Last-Modified`
+- list/history lớn nên ưu tiên cursor pagination ngoài `page/limit`
 - response format thống nhất:
 
 ```json
@@ -1069,9 +1184,11 @@ Response ví dụ cho `answer`:
 #### Admin / import
 
 - `POST /api/v1/admin/vocab/import/preview`
-- `POST /api/v1/admin/vocab/import/commit`
-- `PATCH /api/v1/admin/vocab/books/:bookId/publish`
+- `POST /api/v1/admin/vocab/import/commit`   -- enqueue job, trả `job_id`
+- `PATCH /api/v1/admin/vocab/books/:bookId/publish`   -- enqueue publish job
 - `PATCH /api/v1/admin/vocab/books/:bookId/unpublish`
+- `GET /api/v1/admin/vocab/books/:bookId/revisions`
+- `POST /api/v1/admin/vocab/books/:bookId/rollback`
 
 ### 7.5. Grammar endpoints
 
@@ -1084,7 +1201,8 @@ Response ví dụ cho `answer`:
 Response nên gồm:
 
 - metadata
-- markdown content
+- source markdown
+- parsed blocks
 - rendered content
 - keywords highlight
 - related exercises
@@ -1097,9 +1215,11 @@ Response nên gồm:
 #### Admin import / publish
 
 - `POST /api/v1/admin/grammar/import/preview`
-- `POST /api/v1/admin/grammar/import/commit`
-- `PATCH /api/v1/admin/grammar/lessons/:lessonId/publish`
+- `POST /api/v1/admin/grammar/import/commit`   -- enqueue job, trả `job_id`
+- `PATCH /api/v1/admin/grammar/lessons/:lessonId/publish`   -- enqueue publish job
 - `PATCH /api/v1/admin/grammar/lessons/:lessonId/unpublish`
+- `GET /api/v1/admin/grammar/lessons/:lessonId/revisions`
+- `POST /api/v1/admin/grammar/lessons/:lessonId/rollback`
 
 ### 7.6. Reading endpoints
 
@@ -1107,7 +1227,7 @@ Response nên gồm:
 
 - `GET /api/v1/reading/documents`
 - `GET /api/v1/reading/documents/:documentId`
-- `GET /api/v1/reading/documents/:documentId/sections`
+- `GET /api/v1/reading/documents/:documentId/sections?cursor=...&limit=...`
 
 #### Progress
 
@@ -1125,19 +1245,28 @@ Request ví dụ:
 #### Admin import / publish
 
 - `POST /api/v1/admin/reading/import/preview`
-- `POST /api/v1/admin/reading/import/commit`
-- `PATCH /api/v1/admin/reading/documents/:documentId/publish`
+- `POST /api/v1/admin/reading/import/commit`   -- enqueue job, trả `job_id`
+- `PATCH /api/v1/admin/reading/documents/:documentId/publish`   -- enqueue publish job
 - `PATCH /api/v1/admin/reading/documents/:documentId/unpublish`
+- `GET /api/v1/admin/reading/documents/:documentId/revisions`
+- `POST /api/v1/admin/reading/documents/:documentId/rollback`
+
+Notes:
+
+- learner endpoints chỉ resolve từ `published_revision_id`
+- preview/draft chỉ có ở admin routes
 
 ### 7.7. Admin ops utility endpoints
 
 - `GET /api/v1/admin/imports`
 - `GET /api/v1/admin/imports/:importId`
+- `GET /api/v1/admin/jobs/:jobId`
 
 Mục đích:
 
 - xem import history
 - xem validation report cũ
+- theo dõi commit/publish jobs
 - debug import lỗi nhanh hơn
 
 ### 7.8. Swagger coverage
@@ -1294,7 +1423,8 @@ Admin Import Page
   -> parse preview
   -> validate metadata
   -> fix lỗi nếu có
-  -> commit
+  -> commit (enqueue job)
+  -> theo dõi job status
   -> publish
 ```
 
@@ -1331,7 +1461,8 @@ Admin Import Page
   -> upload markdown/plain text
   -> parse preview
   -> kiểm tra section pairing EN/VI
-  -> commit
+  -> commit (enqueue job)
+  -> theo dõi job status
   -> publish
 ```
 
@@ -1477,6 +1608,11 @@ Dùng Zustand hoặc React Context cho:
 - theme / font size / highlight toggle
 - resume session info
 - admin import draft state
+- local persistence qua IndexedDB hoặc abstraction tương đương cho:
+  - write-mode input chưa submit xong
+  - pending vocab answer submissions
+  - pending reading progress updates
+  - admin import draft recovery
 
 Ví dụ state Vocabulary:
 
@@ -1530,9 +1666,10 @@ Upload Markdown
   -> extract keywords
   -> render preview
   -> validation report
-  -> commit grammar_lesson
+  -> enqueue commit job
+  -> tạo draft revision
   -> link topic/exercises
-  -> publish/unpublish
+  -> publish/unpublish qua publish job
 ```
 
 ### 11.2. Reading import từ Markdown/text
@@ -1586,8 +1723,10 @@ Upload file
   -> map EN/VI pairs
   -> extract highlights
   -> validation report
-  -> save reading_document + sections
-  -> publish/unpublish
+  -> enqueue commit job
+  -> tạo draft revision
+  -> materialize sections khi publish
+  -> publish/unpublish qua publish job
 ```
 
 ### 11.3. Vocabulary import từ CSV/JSON
@@ -1606,7 +1745,11 @@ Upload file
   -> normalize word/slug
   -> detect duplicates trong file và trong DB
   -> preview N records đầu
-  -> commit
+  -> enqueue commit job
+  -> commit vào draft revision / draft dataset
+  -> validation report
+  -> materialize `vocab_words` / examples / media khi publish
+  -> publish/unpublish book
   -> thống kê success/failed rows
 ```
 
@@ -1618,6 +1761,10 @@ Upload file
 - kiểm tra MIME type
 - ghi `import_errors` đủ chi tiết để sửa được
 - dùng checksum để tránh import trùng ngoài ý muốn
+- preview nên synchronous cho payload vừa phải để feedback nhanh
+- commit/publish nên chạy qua background jobs để tránh timeout và double-submit
+- UI phải poll `job status` hoặc có cơ chế theo dõi tương đương
+- retry commit/publish phải idempotent
 
 ## 12. Business rules
 
@@ -1629,6 +1776,7 @@ Upload file
 - access token hết hạn ngắn, refresh token dài hơn
 - refresh token rotate sau mỗi refresh thành công
 - session có thể revoke riêng từng thiết bị
+- refresh token reuse detection phải revoke được token family liên quan
 
 ### 12.2. Vocabulary
 
@@ -1646,6 +1794,9 @@ Rules:
 - `repeat` ưu tiên từ sai gần đây và từ có streak thấp
 - MCQ phải tránh 4 options trùng hoặc quá dễ phân biệt
 - learner app chỉ hiển thị books có `status = published`
+- import thành công không tự động làm book live; publish là bước tách riêng
+- learner reads của vocabulary đi qua published projection được build từ `published_revision_id`
+- answer submit phải retry-safe khi client retry sau lỗi mạng ngắn
 
 Logic cập nhật trạng thái đề xuất:
 
@@ -1665,6 +1816,9 @@ Ví dụ rule:
 - exercise có thể gắn với topic và lesson
 - keyword highlight phải parse được từ markdown/frontmatter
 - learner app chỉ hiển thị lesson có `status = published`
+- learner chỉ đọc `published_revision_id`, không đọc draft revision
+- publish phải trỏ sang revision đã validate
+- rollback không được làm mất lịch sử revision
 
 ### 12.4. Reading
 
@@ -1672,12 +1826,17 @@ Ví dụ rule:
 - tài liệu dài phải tách sections
 - progress lưu theo section cuối cùng đã đọc
 - section pairing lỗi phải block publish
+- learner chỉ đọc `published_revision_id`
+- section API phải hỗ trợ load theo cửa sổ cho tài liệu dài
 
 ### 12.5. Content ops
 
 - import preview lỗi không được commit một phần âm thầm
 - publish chỉ hợp lệ khi validation pass
 - unpublish không được làm mất lịch sử import
+- publish phải trỏ sang một `published_revision_id` bất biến, không overwrite trực tiếp bản live
+- cần hỗ trợ rollback sang revision đã publish trước đó
+- commit/publish là job-backed operations có retry và auditability rõ ràng
 
 ## 13. Error handling strategy
 
@@ -1698,6 +1857,8 @@ Chuẩn hóa error code:
 - `VALIDATION_ERROR`
 - `NOT_FOUND`
 - `CONFLICT`
+- `PRECONDITION_FAILED`
+- `IDEMPOTENCY_CONFLICT`
 - `RATE_LIMITED`
 - `INTERNAL_SERVER_ERROR`
 - `IMPORT_PARSE_ERROR`
@@ -1732,10 +1893,12 @@ Cases cụ thể:
 - Vocabulary:
   - không tải được next question -> cho retry
   - submit answer fail -> giữ nguyên câu hiện tại, không mất input
+  - nếu lỗi mạng ngắn -> queue submit cục bộ và retry an toàn bằng `Idempotency-Key`
 - Grammar:
   - markdown render fail -> hiển thị fallback raw text nếu có
 - Reading:
   - section load lỗi -> retry riêng từng section
+  - progress update fail -> giữ pending progress cục bộ và flush lại khi online
 - Admin import:
   - preview fail -> giữ file/raw input, hiện validation report, không xóa draft
 
@@ -1753,6 +1916,9 @@ Cases cụ thể:
 - refresh cookie phải có `HttpOnly`, `Secure`, `SameSite` phù hợp deployment model
 - access token chỉ giữ in-memory
 - logout phải clear cookie và revoke session DB
+- refresh token reuse detection phải được test và audit log
+- nếu dùng cookie-authenticated refresh/logout, CSRF protection là mặc định
+- signing key nên hỗ trợ rotation
 
 ### 14.2. API security
 
@@ -1791,6 +1957,7 @@ Khi render Markdown:
   - grammar lesson + exercises
   - reading document + sections
 - có thể precompute hoặc cache nhẹ cho distractor pool nếu cần
+- data integrity nên được khóa ở DB bằng unique/check/index phù hợp, không chỉ ở service validation
 
 ### 15.2. Frontend
 
@@ -1808,6 +1975,7 @@ Khi render Markdown:
 - không render toàn bộ một lần nếu nội dung rất dài
 - lưu progress theo section thay vì pixel scroll
 - desktop sync theo section thay vì pixel-perfect sync
+- section API phải hỗ trợ load theo cửa sổ để tránh trả toàn bộ tài liệu trong một response
 
 ## 16. Testing strategy
 
@@ -1825,6 +1993,8 @@ Test cho:
 - repository query filters
 - highlight matcher / keyword escaper
 - refresh token rotation logic
+- parser fuzz tests cho markdown/reading section parsing
+- strategy determinism tests cho random/sequential/repeat
 
 #### Integration tests
 
@@ -1847,6 +2017,8 @@ Dùng PostgreSQL test DB hoặc container:
 - invalid payload
 - not found cases
 - admin permission cases
+- idempotency/retry behavior
+- optimistic concurrency / version conflict
 
 Gợi ý công cụ:
 
@@ -1884,6 +2056,8 @@ Gợi ý công cụ:
 - mở reading doc và đổi mode hiển thị
 - resume unfinished session
 - import preview -> commit -> publish
+- submit answer lỗi mạng nhưng không mất input
+- reading progress lỗi mạng ngắn rồi replay thành công
 
 Gợi ý công cụ:
 
@@ -1924,6 +2098,7 @@ Gợi ý công cụ:
 - login sai password
 - access token hết hạn
 - refresh token revoked
+- refresh token reuse bị phát hiện và token family bị revoke
 - logout xong không refresh được nữa
 - logout-all xong session cũ không dùng lại được
 
@@ -1939,6 +2114,7 @@ Gợi ý công cụ:
 - ordering sequential đúng sort order
 - repeat mode lặp lại từ sai nhiều hơn
 - session summary tính đúng accuracy
+- retry submit answer không tạo duplicate attempt
 
 ### 17.3. Grammar
 
@@ -1957,6 +2133,7 @@ Gợi ý công cụ:
 - mobile toggle hoạt động đúng
 - progress update đúng section cuối
 - section pairing lỗi thì không publish được
+- replay pending progress sau lỗi mạng không ghi đè sai progress mới hơn
 
 ## 18. Logging, monitoring, observability
 
@@ -1965,12 +2142,14 @@ Gợi ý công cụ:
 Backend nên log:
 
 - `request_id`
+- `trace_id`
 - route
 - method
 - `status_code`
 - latency
 - `user_id`
 - `session_id`
+- `job_id`
 - `import_id`
 - `error_code`
 
@@ -1992,6 +2171,9 @@ Theo dõi:
 - refresh failure rate
 - publish failure rate
 - DB connection saturation
+- job retry rate
+- import/publish completion latency
+- offline replay failure rate
 
 ### 18.3. Product success metrics
 
@@ -2026,6 +2208,8 @@ backend/
 │   │   ├── vocab.go
 │   │   ├── grammar.go
 │   │   └── reading.go
+│   ├── queries/
+│   ├── policies/
 │   ├── dto/
 │   │   ├── auth_dto.go
 │   │   ├── vocab_dto.go
@@ -2037,7 +2221,10 @@ backend/
 │   │   ├── vocab_repository.go
 │   │   ├── grammar_repository.go
 │   │   ├── reading_repository.go
-│   │   └── import_repository.go
+│   │   ├── import_repository.go
+│   │   ├── job_repository.go
+│   │   ├── idempotency_repository.go
+│   │   └── auth_event_repository.go
 │   ├── services/
 │   │   ├── auth_service.go
 │   │   ├── vocab_service.go
@@ -2045,6 +2232,9 @@ backend/
 │   │   ├── reading_service.go
 │   │   ├── import_service.go
 │   │   └── publish_service.go
+│   ├── jobs/
+│   │   ├── dispatcher.go
+│   │   └── workers.go
 │   ├── handlers/
 │   │   ├── auth_handler.go
 │   │   ├── vocab_handler.go
@@ -2108,7 +2298,9 @@ frontend/
 │   ├── store/
 │   │   ├── authStore.ts
 │   │   ├── studySettingsStore.ts
-│   │   └── importDraftStore.ts
+│   │   ├── importDraftStore.ts
+│   │   ├── persistedDraftStore.ts
+│   │   └── mutationQueueStore.ts
 │   ├── hooks/
 │   ├── utils/
 │   └── types/
@@ -2157,6 +2349,10 @@ Exit criteria:
 - reading import preview/commit/publish
 - vocab CSV/JSON import preview/commit
 - import error reporting
+- baseline reliability cho content ops:
+  - async commit/publish jobs
+  - import/publish idempotency
+  - revision history tối thiểu
 
 Exit criteria:
 
@@ -2171,6 +2367,9 @@ Exit criteria:
 - progress tracking
 - resume session
 - summary cuối phiên
+- baseline reliability cho learner writes:
+  - answer submission idempotency
+  - local draft / pending queue cho write mode
 
 Exit criteria:
 
@@ -2198,7 +2397,7 @@ Exit criteria:
 
 - tài liệu dài vẫn đọc mượt trên mobile và desktop
 
-### Phase 6: Hardening & deployment
+### Phase 6: Hardening, scale & deployment
 
 - E2E smoke tests
 - observability
@@ -2225,6 +2424,9 @@ Exit criteria:
 - progress cơ bản
 - resume session
 - admin import preview + commit + publish cho grammar/reading/vocab
+- revisioned publish flow cho grammar/reading
+- async commit/publish jobs cơ bản
+- idempotency cho learner/admin writes quan trọng
 - Docker Compose + migrations + seed data
 - `healthz` / `readyz` + logging cơ bản
 
@@ -2280,6 +2482,7 @@ Giải pháp:
   - random strategy
   - repeat strategy
 - mỗi strategy có test riêng
+- submit/retry phải deterministic và không tạo double attempt
 
 ### 23.4. XSS khi render Markdown
 
@@ -2333,18 +2536,46 @@ Giải pháp:
 - import history
 - publish/unpublish state
 
+### 23.8. Content publish dễ ghi đè hoặc khó rollback
+
+Rủi ro:
+
+- import mới hoặc publish mới có thể vô tình ghi đè content đang live nếu không có revision boundary
+
+Giải pháp:
+
+- dùng `content_revisions`
+- publish chỉ đổi `published_revision_id`
+- rollback về revision cũ mà không mất lịch sử
+
+### 23.9. Retry/double-submit làm sai progress hoặc duplicate import
+
+Rủi ro:
+
+- mạng chập chờn hoặc double click có thể tạo duplicate attempt, duplicate progress update hoặc duplicate import job
+
+Giải pháp:
+
+- `Idempotency-Key`
+- optimistic concurrency cho resource mutable
+- background jobs có retry có kiểm soát
+
 ## 24. Kết luận kiến trúc đề xuất
 
 Kiến trúc phù hợp nhất cho dự án này là:
 
 - frontend React SPA
 - backend Go theo layered architecture
+- layered architecture được bổ sung `policies`, `queries`, `jobs`
 - PostgreSQL với schema tách rõ theo module
 - object storage cho media khi asset upload vào scope
 - import pipeline riêng cho Markdown/text/CSV với `preview -> commit -> publish`
+- commit/publish đi qua background jobs khi operation dài hoặc nặng
 - session-based learning logic cho Vocabulary
 - section-based content model cho Reading
+- revisioned content lifecycle cho content modules, với trọng tâm grammar/reading và book-level draft/live lifecycle rõ ràng cho vocabulary
 - auth hybrid: access token in-memory + refresh token HttpOnly cookie
+- idempotency và optimistic concurrency cho write paths quan trọng
 - Swagger/OpenAPI + migrations + Docker Compose + CI-ready delivery
 - test strategy gồm unit + integration + E2E + manual smoke checklist
 
@@ -2358,4 +2589,5 @@ Cách tổ chức này có các ưu điểm:
 - triển khai thật nhanh hơn
 - an toàn hơn về session/auth
 - vận hành nội dung thực tế tốt hơn
+- giảm overwrite nhầm, retry lỗi và race conditions ở các write path
 - giảm rủi ro "demo chạy được nhưng đội không ship nổi"
